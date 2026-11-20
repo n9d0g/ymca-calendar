@@ -233,3 +233,103 @@ test("holds back with a failure alert when a week page can't be fetched", async 
   assert.match(alerts[0]!.message, /Unexpected fetch/);
   assert.equal(alerts[0]!.published, false);
 });
+
+const weekFetcher = (otherDetail?: string | null) =>
+  fakeFetcher({ [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html") }, otherDetail);
+
+test("treats a missing state as a first run, with no warnings", async () => {
+  const { decision, alerts, state } = await build({ fetch: weekFetcher(), now: NOW });
+  assert.equal(decision, "publish");
+  assert.deepEqual(alerts, []);
+  assert.equal(state.failed, false);
+  assert.ok(state.sessionCounts["group-fitness"]! > 0);
+});
+
+test("two consecutive successful runs produce no alerts", async () => {
+  const first = await build({ fetch: weekFetcher(), now: NOW });
+  const second = await build({ fetch: weekFetcher(), now: NOW, previousState: first.state });
+  assert.deepEqual(first.alerts, []);
+  assert.deepEqual(second.alerts, []);
+  assert.deepEqual(second.state, first.state);
+});
+
+test("warns, and still publishes, when a Category's Session count more than halves", async () => {
+  const { state: normal } = await build({ fetch: weekFetcher(), now: NOW });
+  const count = normal.sessionCounts["group-fitness"]!;
+  const previousState = { sessionCounts: { "group-fitness": count * 2 + 1 }, failed: false };
+
+  const { decision, feeds, alerts, state } = await build({ fetch: weekFetcher(), now: NOW, previousState });
+  assert.equal(decision, "publish");
+  assert.equal(feeds.length, 1);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.severity, "warning");
+  assert.deepEqual(alerts[0]!.categories, ["Group Fitness"]);
+  assert.match(alerts[0]!.message, /Group Fitness/);
+  assert.equal(alerts[0]!.published, true);
+  assert.equal(state.sessionCounts["group-fitness"], count, "the new count becomes the baseline");
+});
+
+test("doesn't warn when a Category's Session count falls by exactly half", async () => {
+  const { state: normal } = await build({ fetch: weekFetcher(), now: NOW });
+  const previousState = { sessionCounts: { "group-fitness": normal.sessionCounts["group-fitness"]! * 2 }, failed: false };
+  const { alerts } = await build({ fetch: weekFetcher(), now: NOW, previousState });
+  assert.deepEqual(alerts, []);
+});
+
+test("warns, and still publishes, when more than 10% of Sessions have no Room", async () => {
+  const { decision, feeds, alerts } = await build({ fetch: weekFetcher(null), now: NOW }); // detail pages fail
+  assert.equal(decision, "publish");
+  assert.equal(feeds.length, 1);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.severity, "warning");
+  assert.match(alerts[0]!.message, /no Room/);
+  assert.deepEqual(alerts[0]!.categories, ["Group Fitness"]);
+  assert.equal(alerts[0]!.published, true);
+});
+
+test("doesn't warn when 10% or fewer of Sessions have no Room", async () => {
+  // Online Sessions have no Room on VirtuaGym; a few of them are normal.
+  const html = fixture("week-1-group-fitness-2026-11-16.html");
+  const ids = [...html.matchAll(/<div id="([^"]+)"[^>]*class="class /g)].map((m) => m[1]!);
+  const roomless = Math.floor(ids.length * 0.1);
+  const pages: Record<string, string> = { [GROUP_FITNESS_WEEK_OF_NOV_16]: html };
+  for (const id of ids.slice(0, roomless)) {
+    pages[`https://ymcamcdonald.virtuagym.com/classes/class/${id}?embedded=1&pref_club=90765`] =
+      '<div class="event-description-holder"><p>Online.</p></div>';
+  }
+  const { alerts } = await build({ fetch: fakeFetcher(pages), now: NOW });
+  assert.ok(roomless > 0);
+  assert.deepEqual(alerts, []);
+});
+
+test("records a failed run, keeping the last good counts", async () => {
+  const good = await build({ fetch: weekFetcher(), now: NOW });
+  const { decision, state } = await build({ fetch: fakeFetcher({}), now: NOW, previousState: good.state });
+  assert.equal(decision, "hold-back");
+  assert.deepEqual(state, { sessionCounts: good.state.sessionCounts, failed: true });
+});
+
+test("sends exactly one recovered alert on the first publish after a failed run", async () => {
+  const good = await build({ fetch: weekFetcher(), now: NOW });
+  const failed = await build({ fetch: fakeFetcher({}), now: NOW, previousState: good.state });
+  const recovered = await build({ fetch: weekFetcher(), now: NOW, previousState: failed.state });
+  const after = await build({ fetch: weekFetcher(), now: NOW, previousState: recovered.state });
+
+  assert.equal(recovered.decision, "publish");
+  assert.deepEqual(
+    recovered.alerts.map((a) => a.severity),
+    ["recovered"],
+  );
+  assert.equal(recovered.alerts[0]!.published, true);
+  assert.equal(recovered.state.failed, false);
+  assert.deepEqual(after.alerts, []);
+});
+
+test("doesn't send a recovered alert while still failing", async () => {
+  const previousState = { sessionCounts: {}, failed: true };
+  const { alerts } = await build({ fetch: fakeFetcher({}), now: NOW, previousState });
+  assert.deepEqual(
+    alerts.map((a) => a.severity),
+    ["failure"],
+  );
+});
