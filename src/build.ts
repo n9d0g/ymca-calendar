@@ -62,9 +62,25 @@ interface Category {
   eventType: number;
   slug: string;
   name: string;
+  /** True for a Category that legitimately has no Sessions, so an empty week isn't a failure. */
+  mayBeEmpty?: boolean;
 }
 
-const CATEGORIES: Category[] = [{ eventType: 1, slug: "group-fitness", name: "Group Fitness" }];
+const CATEGORIES: Category[] = [
+  { eventType: 1, slug: "group-fitness", name: "Group Fitness" },
+  { eventType: 2, slug: "aquatics", name: "Aquatics" },
+  { eventType: 3, slug: "adult-recreational-sports", name: "Adult Recreational Sports" },
+  { eventType: 4, slug: "child-youth-family", name: "Child Youth and Family Programs" },
+  // Has had no Sessions on VirtuaGym at all (checked out to January 2027). The other
+  // four Categories still catch a markup break, which would empty all of them.
+  { eventType: 5, slug: "community-leadership", name: "Community and Leadership", mayBeEmpty: true },
+];
+
+/** Days of past Sessions kept, so last week's don't vanish from calendars the moment they end. */
+const DAYS_BACK = 7;
+
+/** Weeks after the current one to publish. VirtuaGym projects recurring Sessions forever. */
+const WEEKS_AHEAD = 2;
 
 /** How often subscribers are asked to re-fetch; matches the publishing schedule. */
 const REFRESH_HOURS = 6;
@@ -79,7 +95,8 @@ const COUNT_DROP_THRESHOLD = 0.5;
 const MISSING_ROOM_THRESHOLD = 0.1;
 
 /**
- * Builds one Feed per Category from the Centre's current week on VirtuaGym.
+ * Builds one Feed per Category from VirtuaGym, covering the past 7 days, the
+ * current week and the next 2 weeks in Centre time.
  *
  * Holds back, with a failure alert, if any Category finds no Sessions this week
  * or can't be fetched or parsed: publishing then would wipe subscribers' calendars.
@@ -94,8 +111,13 @@ export async function build({
   detailCache = {},
   previousState,
 }: BuildInput): Promise<BuildResult> {
-  const monday = mondayOf(localDate(now, CENTRE_TIME_ZONE));
+  const today = localDate(now, CENTRE_TIME_ZONE);
+  const monday = mondayOf(today);
   const sunday = addDays(monday, 6);
+  const windowStart = addDays(today, -DAYS_BACK);
+  const windowEnd = addDays(sunday, 7 * WEEKS_AHEAD);
+  const weeks: string[] = [];
+  for (let week = mondayOf(windowStart); week <= windowEnd; week = addDays(week, 7)) weeks.push(week);
 
   const feeds: Feed[] = [];
   const nextCache: DetailCache = {};
@@ -108,25 +130,32 @@ export async function build({
   const errored: Array<{ category: string; error: string }> = [];
 
   for (const category of CATEGORIES) {
-    let sessions: ListedSession[];
+    const sessions: ListedSession[] = [];
     try {
-      sessions = parseWeek(await fetch(weekUrl(category.eventType, monday))).filter(
-        (s) => s.date >= monday && s.date <= sunday,
-      );
+      const seen = new Set<string>();
+      for (const week of weeks) {
+        for (const s of parseWeek(await fetch(weekUrl(category.eventType, week)))) {
+          if (s.date < windowStart || s.date > windowEnd || seen.has(s.id)) continue;
+          seen.add(s.id);
+          sessions.push(s);
+        }
+      }
     } catch (err) {
       errored.push({ category: category.name, error: errorMessage(err) });
       continue;
     }
-    if (sessions.length === 0) {
+    // This week is the health check: past weeks can thin out and future ones may not be scheduled yet.
+    const thisWeek = sessions.filter((s) => s.date >= monday && s.date <= sunday).length;
+    if (thisWeek === 0 && !category.mayBeEmpty) {
       empty.push(category.name);
       continue;
     }
     const details = await fetchDetails(sessions, fetch, detailCache, nextCache);
 
-    sessionCounts[category.slug] = sessions.length;
+    sessionCounts[category.slug] = thisWeek;
     const previousCount = previousState?.sessionCounts[category.slug];
-    if (previousCount !== undefined && sessions.length < previousCount * (1 - COUNT_DROP_THRESHOLD)) {
-      dropped.push({ category: category.name, from: previousCount, to: sessions.length });
+    if (previousCount !== undefined && thisWeek < previousCount * (1 - COUNT_DROP_THRESHOLD)) {
+      dropped.push({ category: category.name, from: previousCount, to: thisWeek });
     }
     const missing = sessions.filter((s) => !details.get(s.id)?.room).length;
     if (missing > 0) withoutRoom.push(category.name);
@@ -140,7 +169,7 @@ export async function build({
         timeZone: CENTRE_TIME_ZONE,
         refreshHours: REFRESH_HOURS,
         stamp: now,
-        events: sessions.map((s) => toEvent(s, details.get(s.id))),
+        events: sessions.map((s) => toEvent(s, category, details.get(s.id))),
       }),
     });
   }
@@ -255,8 +284,14 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function toEvent(s: ListedSession, detail: SessionDetail | undefined): CalendarEvent {
-  const description = [s.leader ? `Leader: ${s.leader}` : null, detail?.description ?? null]
+function toEvent(s: ListedSession, category: Category, detail: SessionDetail | undefined): CalendarEvent {
+  const facts = [
+    s.leader ? `Leader: ${s.leader}` : null,
+    `Category: ${category.name}`,
+    s.program.includes("ⓢ") ? "Sign-up required" : null,
+    s.program.includes("ⓡ") ? "Registration required" : null,
+  ].filter((line) => line !== null);
+  const description = [facts.join("\n"), detail?.description ?? null]
     .filter((part) => part !== null)
     .join("\n\n");
   return {

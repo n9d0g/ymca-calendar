@@ -9,5 +9,5 @@ The McDonald Centre's schedule lives in VirtuaGym (club `90765`). VirtuaGym's of
 
 ## Consequences
 
-- A markup change silently yields zero or malformed Sessions. The build therefore refuses to publish when a Category finds no Sessions for the current week, and alerts instead.
+- A markup change silently yields zero or malformed Sessions. The build therefore refuses to publish when a Category finds no Sessions for the current week, and alerts instead. The exception is Community and Leadership, which has never had any Sessions on VirtuaGym. It may publish empty, and the other four Categories still catch a markup change, since one would empty all of them.
 - To keep request volume low, we cache detail pages by Session ID and only publish the current week plus the next two.
