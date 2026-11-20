@@ -114,3 +114,34 @@ test("omits the Leader line when VirtuaGym lists no Leader", async () => {
   assert.ok(session, "Wed 2026-11-18 MuscleFit not found");
   assert.equal(session.DESCRIPTION, undefined);
 });
+
+test("publishes with no alerts on an ordinary success", async () => {
+  const { result } = run();
+  const { decision, alerts } = await result;
+  assert.equal(decision, "publish");
+  assert.deepEqual(alerts, []);
+});
+
+test("holds back with a failure alert when a Category has no Sessions this week", async () => {
+  // A page whose markup no longer matches, as after a VirtuaGym redesign.
+  const fetch = fakeFetcher({ [GROUP_FITNESS_WEEK_OF_NOV_16]: "<html><body><p>Schedule</p></body></html>" });
+  const { decision, feeds, alerts } = await build({ fetch, now: NOW });
+  assert.equal(decision, "hold-back");
+  assert.deepEqual(feeds, []);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.severity, "failure");
+  assert.deepEqual(alerts[0]!.categories, ["Group Fitness"]);
+  assert.equal(alerts[0]!.published, false);
+});
+
+test("holds back with a failure alert when a week page can't be fetched", async () => {
+  const fetch = fakeFetcher({}); // every fetch throws
+  const { decision, feeds, alerts } = await build({ fetch, now: NOW });
+  assert.equal(decision, "hold-back");
+  assert.deepEqual(feeds, []);
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.severity, "failure");
+  assert.deepEqual(alerts[0]!.categories, ["Group Fitness"]);
+  assert.match(alerts[0]!.message, /Unexpected fetch/);
+  assert.equal(alerts[0]!.published, false);
+});
