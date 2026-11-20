@@ -10,11 +10,21 @@ export type Fetcher = (url: string) => Promise<string>;
 /** Detail-page results by Session ID, kept between runs so each Session's page is fetched once. */
 export type DetailCache = Record<string, SessionDetail>;
 
+/** What one run remembers for the next. */
+export interface RunState {
+  /** Sessions this week per Category slug, from the last run that published. */
+  sessionCounts: Record<string, number>;
+  /** Whether the last run held back or crashed. */
+  failed: boolean;
+}
+
 export interface BuildInput {
   fetch: Fetcher;
   now: Date;
   /** The previous run's detail cache; empty on a first run or after the cache is lost. */
   detailCache?: DetailCache;
+  /** The previous run's state; absent on a first run or after the state is lost. */
+  previousState?: RunState;
 }
 
 export interface Feed {
@@ -44,6 +54,8 @@ export interface BuildResult {
   alerts: Alert[];
   /** The detail cache to keep for the next run; on publish, it holds only this run's Sessions. */
   detailCache: DetailCache;
+  /** The state to keep for the next run. */
+  state: RunState;
 }
 
 interface Category {
@@ -60,18 +72,38 @@ const REFRESH_HOURS = 6;
 /** Detail pages fetched at once, to stay polite to VirtuaGym. */
 const DETAIL_CONCURRENCY = 4;
 
+/** A Category losing more than this share of its Sessions since the last run is suspicious. */
+const COUNT_DROP_THRESHOLD = 0.5;
+
+/** More than this share of Sessions without a Room suggests detail pages are failing. */
+const MISSING_ROOM_THRESHOLD = 0.1;
+
 /**
  * Builds one Feed per Category from the Centre's current week on VirtuaGym.
  *
  * Holds back, with a failure alert, if any Category finds no Sessions this week
  * or can't be fetched or parsed: publishing then would wipe subscribers' calendars.
+ *
+ * Publishes with a warning when a Category's Session count more than halves since the
+ * last run, or when more than ~10% of Sessions have no Room. Sends one "recovered" alert
+ * on the first publish after a failed run. An ordinary success sends nothing.
  */
-export async function build({ fetch, now, detailCache = {} }: BuildInput): Promise<BuildResult> {
+export async function build({
+  fetch,
+  now,
+  detailCache = {},
+  previousState,
+}: BuildInput): Promise<BuildResult> {
   const monday = mondayOf(localDate(now, CENTRE_TIME_ZONE));
   const sunday = addDays(monday, 6);
 
   const feeds: Feed[] = [];
   const nextCache: DetailCache = {};
+  const sessionCounts: Record<string, number> = {};
+  const dropped: Array<{ category: string; from: number; to: number }> = [];
+  const withoutRoom: string[] = [];
+  let sessionTotal = 0;
+  let missingRooms = 0;
   const empty: string[] = [];
   const errored: Array<{ category: string; error: string }> = [];
 
@@ -90,6 +122,16 @@ export async function build({ fetch, now, detailCache = {} }: BuildInput): Promi
       continue;
     }
     const details = await fetchDetails(sessions, fetch, detailCache, nextCache);
+
+    sessionCounts[category.slug] = sessions.length;
+    const previousCount = previousState?.sessionCounts[category.slug];
+    if (previousCount !== undefined && sessions.length < previousCount * (1 - COUNT_DROP_THRESHOLD)) {
+      dropped.push({ category: category.name, from: previousCount, to: sessions.length });
+    }
+    const missing = sessions.filter((s) => !details.get(s.id)?.room).length;
+    if (missing > 0) withoutRoom.push(category.name);
+    sessionTotal += sessions.length;
+    missingRooms += missing;
     feeds.push({
       slug: category.slug,
       filename: `${category.slug}.ics`,
@@ -121,10 +163,52 @@ export async function build({ fetch, now, detailCache = {} }: BuildInput): Promi
     });
   }
 
-  return alerts.length > 0
-    ? // Keep the old entries too: a broken Category's Sessions will likely be back next run.
-      { decision: "hold-back", feeds: [], alerts, detailCache: { ...detailCache, ...nextCache } }
-    : { decision: "publish", feeds, alerts, detailCache: nextCache };
+  if (alerts.length > 0) {
+    return {
+      decision: "hold-back",
+      feeds: [],
+      alerts,
+      // Keep the old entries too: a broken Category's Sessions will likely be back next run.
+      detailCache: { ...detailCache, ...nextCache },
+      // Keep the last good counts, so the next publish is compared against them.
+      state: { sessionCounts: previousState?.sessionCounts ?? {}, failed: true },
+    };
+  }
+
+  if (previousState?.failed) {
+    alerts.push({
+      severity: "recovered",
+      message: "The Feeds published again after a failed run.",
+      categories: [],
+      published: true,
+    });
+  }
+  if (dropped.length > 0) {
+    alerts.push({
+      severity: "warning",
+      message: `Session count fell by more than half since the last run: ${dropped
+        .map((d) => `${d.category} (${d.from} → ${d.to})`)
+        .join(", ")}.`,
+      categories: dropped.map((d) => d.category),
+      published: true,
+    });
+  }
+  if (sessionTotal > 0 && missingRooms / sessionTotal > MISSING_ROOM_THRESHOLD) {
+    alerts.push({
+      severity: "warning",
+      message: `${missingRooms} of ${sessionTotal} Sessions have no Room. Detail pages may be failing.`,
+      categories: withoutRoom,
+      published: true,
+    });
+  }
+
+  return {
+    decision: "publish",
+    feeds,
+    alerts,
+    detailCache: nextCache,
+    state: { sessionCounts, failed: false },
+  };
 }
 
 /**
