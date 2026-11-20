@@ -30,7 +30,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # Exits non-zero when the build holds back, so nothing below runs and the
+      # last good Feeds stay live on Pages. PR runs don't alert.
       - run: npm run build
+        env:
+          DISCORD_WEBHOOK_URL: ${{ github.event_name != 'pull_request' && secrets.DISCORD_WEBHOOK_URL || '' }}
       - if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
