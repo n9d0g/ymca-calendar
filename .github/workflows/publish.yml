@@ -27,9 +27,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - name: Install
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test
       # Cache entries are immutable, so each run saves under its own key and the
       # next run restores the newest by prefix. Losing it only makes a run slower.
       - uses: actions/cache/restore@v4
@@ -39,7 +42,8 @@ jobs:
           restore-keys: state-
       # Exits non-zero when the build holds back, so the Pages upload and deploy
       # are skipped and the last good Feeds stay live. PR runs don't alert.
-      - run: npm run build
+      - name: Build Feeds
+        run: npm run build
         env:
           DISCORD_WEBHOOK_URL: ${{ github.event_name != 'pull_request' && secrets.DISCORD_WEBHOOK_URL || '' }}
       # Saved even when the build holds back, so its fetched detail pages aren't lost.
@@ -60,6 +64,134 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # Same deploy notification as the other repos. Scheduled runs post only when
+  # the Pages deploy itself fails: a held-back build already alerts from the
+  # build step, and a success every 6 hours would drown out real alerts.
+  notify:
+    needs: [build, deploy]
+    if: >-
+      always() && github.event_name != 'pull_request' &&
+      (github.event_name != 'schedule' || needs.deploy.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Notify Discord
+        env:
+          SITE_NAME: YMCA Feeds
+          DEPLOY_URL: ${{ needs.deploy.outputs.page_url || 'https://n9d0g.github.io/ymca-calendar/' }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          COMMITS_JSON: ${{ toJSON(github.event.commits) }}
+          COMPARE_URL: ${{ github.event.compare }}
+          GH_TOKEN: ${{ github.token }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set, skipping notification."
+            exit 0
+          fi
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          RUN_URL="${REPO_URL}/actions/runs/${GITHUB_RUN_ID}"
+          COMMIT_URL="${REPO_URL}/commit/${GITHUB_SHA}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          # gh api prints an error body to stdout when it fails, so keep its
+          # output only when it succeeds.
+          api() { local out; out=$(gh api "$@" 2>/dev/null) && printf '%s' "$out"; }
+
+          # The first step that failed, from the run's jobs, in pipeline order.
+          FAILED_AT=""
+          if [ "$BUILD_RESULT" = "failure" ] || [ "$DEPLOY_RESULT" = "failure" ]; then
+            FAILED_AT=$(api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+              --jq '[.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | .name][0] // empty' || true)
+            if [ -z "$FAILED_AT" ]; then
+              if [ "$BUILD_RESULT" = "failure" ]; then FAILED_AT="Build"; else FAILED_AT="Deploy"; fi
+            fi
+          fi
+
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            OUTCOME="success"
+          elif [ -n "$FAILED_AT" ]; then
+            OUTCOME="failure"
+          elif [ "$BUILD_RESULT" = "cancelled" ] || [ "$DEPLOY_RESULT" = "cancelled" ]; then
+            OUTCOME="cancelled"
+          else
+            OUTCOME="${DEPLOY_RESULT:-unknown}"
+          fi
+
+          case "$OUTCOME" in
+            success) TITLE="🚀 ${SITE_NAME} deployed successfully"; COLOR=5763719; TITLE_URL="$DEPLOY_URL" ;;
+            failure) TITLE="❌ ${SITE_NAME} deployment failed at ${FAILED_AT}"; COLOR=15548997; TITLE_URL="$RUN_URL" ;;
+            *) TITLE="⚠️ ${SITE_NAME} deployment ${OUTCOME}"; COLOR=16705372; TITLE_URL="$RUN_URL" ;;
+          esac
+
+          # Commits in this push, newest first (fall back to HEAD if the payload has none,
+          # as on a manual or scheduled run)
+          COMMITS=$(jq -r '
+            if type == "array" and length > 0 then
+              length as $n
+              | (.[-10:] | reverse
+                 | map("[`\(.id[0:7])`](\(.url)) \(.message | split("\n")[0] | .[0:72]) — \(.author.username // .author.name)")
+                 | join("\n"))
+                + (if $n > 10 then "\n…and \($n - 10) more" else "" end)
+            else empty end' <<< "$COMMITS_JSON" 2>/dev/null || true)
+          if [ -z "$COMMITS" ]; then
+            SUBJECT=$(api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}" --jq '.commit.message | split("\n")[0] | .[0:72]' || true)
+            COMMITS="[\`${SHORT_SHA}\`](${COMMIT_URL}) ${SUBJECT}"
+          fi
+
+          DURATION=""
+          STARTED_AT=$(api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.run_started_at // empty' || true)
+          if [ -n "$STARTED_AT" ]; then
+            ELAPSED=$(( $(date +%s) - $(date -d "$STARTED_AT" +%s) ))
+            DURATION="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" --arg title_url "$TITLE_URL" --argjson color "$COLOR" \
+            --arg commits "$COMMITS" --arg branch "$BRANCH" --arg sha "$SHORT_SHA" \
+            --arg commit_url "$COMMIT_URL" --arg actor "$GITHUB_ACTOR" --arg duration "$DURATION" \
+            --arg failed_at "$FAILED_AT" --arg trigger "$GITHUB_EVENT_NAME" \
+            --arg run_number "$GITHUB_RUN_NUMBER" --arg timestamp "$TIMESTAMP" \
+            --arg outcome "$OUTCOME" --arg site_url "$DEPLOY_URL" --arg run_url "$RUN_URL" \
+            --arg compare_url "$COMPARE_URL" \
+            '{
+              allowed_mentions: {parse: []},
+              embeds: [{
+                title: $title, url: $title_url, color: $color, description: $commits,
+                fields: (
+                  [
+                    {name: "Branch", value: ("`" + $branch + "`"), inline: true},
+                    {name: "Commit", value: ("[`" + $sha + "`](" + $commit_url + ")"), inline: true},
+                    {name: "Triggered by", value: (if $trigger == "push" then $actor else ($actor + " (" + $trigger + ")") end), inline: true}
+                  ]
+                  + (if $failed_at != "" then [{name: "Failed at", value: $failed_at, inline: true}] else [] end)
+                  + (if $duration != "" then [{name: "Duration", value: $duration, inline: true}] else [] end)
+                ),
+                footer: {text: ("Run #" + $run_number)},
+                timestamp: $timestamp
+              }],
+              components: [{
+                type: 1,
+                components: (
+                  (if $outcome == "success" then [{type: 2, style: 5, label: "🌐 Visit site", url: $site_url}] else [] end)
+                  + [{type: 2, style: 5, label: "📋 Workflow run", url: $run_url}]
+                  + (if $compare_url != "" then [{type: 2, style: 5, label: "🔍 View changes", url: $compare_url}] else [] end)
+                )
+              }]
+            }')
+
+          # with_components lets a plain webhook send link buttons
+          curl -fsS -H "Content-Type: application/json" -X POST -d "$PAYLOAD" \
+            "${DISCORD_WEBHOOK_URL}?with_components=true"
