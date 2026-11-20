@@ -5,6 +5,7 @@ export interface CalendarEvent {
   start: Date;
   end: Date;
   summary: string;
+  location?: string;
   description?: string;
 }
 
@@ -38,6 +39,7 @@ export function renderCalendar(cal: Calendar): string {
       `DTEND:${utcStamp(e.end)}`,
       `SUMMARY:${escapeText(e.summary)}`,
     );
+    if (e.location) lines.push(`LOCATION:${escapeText(e.location)}`);
     if (e.description) lines.push(`DESCRIPTION:${escapeText(e.description)}`);
     lines.push("END:VEVENT");
   }

@@ -7,13 +7,30 @@ import type { Fetcher } from "../src/build.ts";
 const fixture = (name: string) =>
   readFileSync(new URL(`../fixtures/virtuagym/${name}`, import.meta.url), "utf8");
 
-/** Serves captured VirtuaGym pages; any URL not listed is a test failure. */
-function fakeFetcher(pages: Record<string, string>): Fetcher & { requested: string[] } {
+const DETAIL_URL = /^https:\/\/ymcamcdonald\.virtuagym\.com\/classes\/class\/([^?]+)\?embedded=1&pref_club=90765$/;
+const isDetailUrl = (url: string) => DETAIL_URL.test(url);
+
+/** A minimal detail page in VirtuaGym's markup. */
+const detailPage = (room: string, description: string) => `
+  <div class="event-description-holder"><p>${description}</p></div>
+  <div class="event-details-icons">
+    <div class="event-details-icon"><div class="ui-tooltip-icon size-24 location"></div>
+      <div class="icon-text">${room}</div></div>
+  </div>`;
+
+/**
+ * Serves captured VirtuaGym pages. Any other week page is an error. Any other detail page
+ * gets `otherDetail`, or an error if it's null.
+ */
+function fakeFetcher(
+  pages: Record<string, string>,
+  otherDetail: string | null = detailPage("Studio", "A Program."),
+): Fetcher & { requested: string[] } {
   const requested: string[] = [];
   const fetcher = async (url: string) => {
     requested.push(url);
-    const page = pages[url];
-    if (page === undefined) throw new Error(`Unexpected fetch: ${url}`);
+    const page = pages[url] ?? (isDetailUrl(url) ? otherDetail : undefined);
+    if (page == null) throw new Error(`Unexpected fetch: ${url}`);
     return page;
   };
   return Object.assign(fetcher, { requested });
@@ -22,12 +39,17 @@ function fakeFetcher(pages: Record<string, string>): Fetcher & { requested: stri
 const GROUP_FITNESS_WEEK_OF_NOV_16 =
   "https://ymcamcdonald.virtuagym.com/classes/week/2026-11-16?event_type=1&embedded=1&pref_club=90765";
 
+// Fri 2026-11-20 06:30 MuscleFit, whose detail page is captured in the fixtures.
+const MUSCLEFIT_FRI = "401221148-682cd326b324f0-04288651";
+const MUSCLEFIT_FRI_DETAIL = `https://ymcamcdonald.virtuagym.com/classes/class/${MUSCLEFIT_FRI}?embedded=1&pref_club=90765`;
+
 // Friday 2026-11-20, noon in Toronto (EST, UTC-5).
 const NOW = new Date("2026-11-20T17:00:00Z");
 
 const run = () => {
   const fetch = fakeFetcher({
     [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html"),
+    [MUSCLEFIT_FRI_DETAIL]: fixture("detail-musclefit.html"),
   });
   return { fetch, result: build({ fetch, now: NOW }) };
 };
@@ -60,7 +82,7 @@ const feedFor = async (slug: string) => {
 test("fetches the current Toronto week's Group Fitness page", async () => {
   const { fetch, result } = run();
   await result;
-  assert.deepEqual(fetch.requested, [GROUP_FITNESS_WEEK_OF_NOV_16]);
+  assert.deepEqual(fetch.requested.filter((u) => !isDetailUrl(u)), [GROUP_FITNESS_WEEK_OF_NOV_16]);
 });
 
 test("publishes a Group Fitness Feed with a calendar name", async () => {
@@ -78,7 +100,73 @@ test("maps a Session to an event in Toronto time, with its Leader", async () => 
   );
   assert.ok(muscleFit, "MuscleFit on Fri 2026-11-20 06:30 Toronto not found");
   assert.equal(muscleFit.DTEND, "20261120T121500Z");
-  assert.equal(muscleFit.DESCRIPTION, "Leader: Eduardo Gonzalez");
+  assert.match(muscleFit.DESCRIPTION!, /^Leader: Eduardo Gonzalez\\n\\n/);
+});
+
+test("shows the Room as the location and the Program description last, from the detail page", async () => {
+  const events = parseEvents((await feedFor("group-fitness")).ics);
+  const muscleFit = events.find((e) => e.UID === `${MUSCLEFIT_FRI}@ymca-calendar`);
+  assert.ok(muscleFit, "Fri MuscleFit not found");
+  assert.equal(muscleFit.LOCATION, "Gym 1 and 2");
+  assert.match(
+    muscleFit.DESCRIPTION!,
+    /^Leader: Eduardo Gonzalez\\n\\nYMCA MuscleFit is a high-energy\\, strength-based group fitness class.*strength journey\.$/,
+  );
+});
+
+test("trims the Room, as on the AquaFit detail page", async () => {
+  // AquaFit's Room is "Pool " in its detail fixture.
+  const fetch = fakeFetcher({
+    [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html"),
+    [MUSCLEFIT_FRI_DETAIL]: fixture("detail-aquafit.html"),
+  });
+  const { feeds } = await build({ fetch, now: NOW });
+  const event = parseEvents(feeds[0]!.ics).find((e) => e.UID === `${MUSCLEFIT_FRI}@ymca-calendar`);
+  assert.equal(event?.LOCATION, "Pool");
+});
+
+test("doesn't fetch the detail page of a Session already in the cache", async () => {
+  const fetch = fakeFetcher({
+    [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html"),
+  });
+  const detailCache = { [MUSCLEFIT_FRI]: { room: "Cached Room", description: "Cached description." } };
+  const result = await build({ fetch, now: NOW, detailCache });
+  assert.ok(!fetch.requested.includes(MUSCLEFIT_FRI_DETAIL));
+  const event = parseEvents(result.feeds[0]!.ics).find((e) => e.UID === `${MUSCLEFIT_FRI}@ymca-calendar`);
+  assert.equal(event?.LOCATION, "Cached Room");
+  assert.deepEqual(result.detailCache[MUSCLEFIT_FRI], detailCache[MUSCLEFIT_FRI]);
+});
+
+test("returns a cache that serves the next run without any detail fetches", async () => {
+  const first = await run().result;
+  const fetch = fakeFetcher({ [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html") }, null);
+  const second = await build({ fetch, now: NOW, detailCache: first.detailCache });
+  assert.deepEqual(fetch.requested, [GROUP_FITNESS_WEEK_OF_NOV_16]);
+  assert.equal(second.feeds[0]!.ics, first.feeds[0]!.ics);
+});
+
+test("drops cache entries for Sessions no longer listed", async () => {
+  const { detailCache } = await build({
+    fetch: run().fetch,
+    now: NOW,
+    detailCache: { "gone-session": { room: "Studio", description: null } },
+  });
+  assert.equal(detailCache["gone-session"], undefined);
+  assert.ok(detailCache[MUSCLEFIT_FRI]);
+});
+
+test("publishes a Session without a Room when its detail page fails to load", async () => {
+  const fetch = fakeFetcher(
+    { [GROUP_FITNESS_WEEK_OF_NOV_16]: fixture("week-1-group-fitness-2026-11-16.html") },
+    null, // every detail page fails
+  );
+  const { decision, feeds, detailCache } = await build({ fetch, now: NOW });
+  assert.equal(decision, "publish");
+  const event = parseEvents(feeds[0]!.ics).find((e) => e.UID === `${MUSCLEFIT_FRI}@ymca-calendar`);
+  assert.ok(event, "Fri MuscleFit not found");
+  assert.equal(event.LOCATION, undefined);
+  assert.equal(event.DESCRIPTION, "Leader: Eduardo Gonzalez");
+  assert.equal(detailCache[MUSCLEFIT_FRI], undefined, "a failed page isn't cached, so it's retried");
 });
 
 test("gives each Session a UID from its VirtuaGym Session ID, stable across runs", async () => {
@@ -112,7 +200,7 @@ test("omits the Leader line when VirtuaGym lists no Leader", async () => {
   const events = parseEvents(feeds[0]!.ics);
   const session = events.find((e) => e.UID === "1299926966-682cd055cc38a7-29770412@ymca-calendar");
   assert.ok(session, "Wed 2026-11-18 MuscleFit not found");
-  assert.equal(session.DESCRIPTION, undefined);
+  assert.doesNotMatch(session.DESCRIPTION ?? "", /Leader/);
 });
 
 test("publishes with no alerts on an ordinary success", async () => {
