@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { build, crashAlert } from "./build.ts";
-import type { Alert, Fetcher } from "./build.ts";
+import type { Alert, DetailCache, Fetcher } from "./build.ts";
 import { actionsRunUrl, postAlerts } from "./discord.ts";
 
 const USER_AGENT = "Mozilla/5.0 (compatible; ymca-calendar/1.0)";
@@ -26,8 +26,31 @@ const logAlerts = (alerts: Alert[]) => {
 
 const outDir = process.argv[2] ?? "public";
 
+/** Where run-to-run data lives; the workflow restores and saves this directory via the Actions cache. */
+const STATE_DIR = process.env.STATE_DIR ?? ".state";
+const DETAIL_CACHE_FILE = join(STATE_DIR, "detail-cache.json");
+
+/** A missing or unreadable file means a first run. */
+async function loadJson<T>(path: string, fallback: T): Promise<T> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function saveJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(value));
+}
+
 try {
-  const { decision, feeds, alerts } = await build({ fetch: httpFetcher, now: new Date() });
+  const { decision, feeds, alerts, detailCache } = await build({
+    fetch: httpFetcher,
+    now: new Date(),
+    detailCache: await loadJson<DetailCache>(DETAIL_CACHE_FILE, {}),
+  });
+  await saveJson(DETAIL_CACHE_FILE, detailCache);
   logAlerts(alerts);
 
   if (decision === "hold-back") {

@@ -30,11 +30,24 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      # Exits non-zero when the build holds back, so nothing below runs and the
-      # last good Feeds stay live on Pages. PR runs don't alert.
+      # Cache entries are immutable, so each run saves under its own key and the
+      # next run restores the newest by prefix. Losing it only makes a run slower.
+      - uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      # Exits non-zero when the build holds back, so the Pages upload and deploy
+      # are skipped and the last good Feeds stay live. PR runs don't alert.
       - run: npm run build
         env:
           DISCORD_WEBHOOK_URL: ${{ github.event_name != 'pull_request' && secrets.DISCORD_WEBHOOK_URL || '' }}
+      # Saved even when the build holds back, so its fetched detail pages aren't lost.
+      - if: always() && hashFiles('.state/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
       - if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:

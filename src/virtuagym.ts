@@ -47,3 +47,32 @@ export function parseWeek(html: string): ListedSession[] {
   });
   return sessions;
 }
+
+/** What a Session's detail page adds to its week-page listing. */
+export interface SessionDetail {
+  room: string | null;
+  description: string | null;
+}
+
+export function detailUrl(sessionId: string): string {
+  return `${ORIGIN}/classes/class/${encodeURIComponent(sessionId)}?embedded=1&pref_club=${CLUB_ID}`;
+}
+
+/** Parses a Session's detail page for its Room and Program description. */
+export function parseDetail(html: string): SessionDetail {
+  const $ = cheerio.load(html);
+  const room = $(".event-details-icon")
+    .filter((_, el) => $(el).find(".ui-tooltip-icon.location").length > 0)
+    .first()
+    .find(".icon-text")
+    .text()
+    .trim();
+  const holder = $(".event-description-holder").first();
+  const paragraphs = holder
+    .find("p")
+    .map((_, p) => $(p).text().trim())
+    .get()
+    .filter(Boolean);
+  const description = paragraphs.length > 0 ? paragraphs.join("\n\n") : holder.text().trim();
+  return { room: room || null, description: description || null };
+}
