@@ -20,7 +20,7 @@ const isDetailUrl = (url: string) => url.startsWith(`${ORIGIN}/classes/class/`);
 const NOW = new Date("2026-11-23T17:00:00Z");
 const WEEKS = ["2026-11-16", "2026-11-23", "2026-11-30", "2026-12-07"];
 
-const SLUGS = ["group-fitness", "aquatics", "adult-recreational-sports", "child-youth-family", "community-leadership"];
+const SPACE_SLUGS = ["pool", "gyms", "studio-1", "studio-2"];
 
 /** VirtuaGym's real page for a week with no Sessions: Community and Leadership has none at all. */
 const EMPTY_WEEK = fixture("week-5-community-leadership-2026-11-23.html");
@@ -63,7 +63,7 @@ const detailPage = (room: string, description: string) => `
  */
 function fakeFetcher(
   pages: Record<string, string> = allPages(),
-  otherDetail: string | null = detailPage("Studio", "A Program."),
+  otherDetail: string | null = detailPage("Studio 2", "A Program."),
 ): Fetcher & { requested: string[] } {
   const requested: string[] = [];
   const fetcher = async (url: string) => {
@@ -101,6 +101,8 @@ const feedIn = (feeds: Array<{ slug: string; ics: string }>, slug: string) => {
   return feed;
 };
 const eventsIn = (feeds: Array<{ slug: string; ics: string }>, slug: string) => parseEvents(feedIn(feeds, slug).ics);
+const allEvents = (feeds: Array<{ ics: string }>) => feeds.flatMap((f) => parseEvents(f.ics));
+const uidOf = (sessionId: string) => `${sessionId}@ymca-calendar`;
 const eventFor = (feeds: Array<{ slug: string; ics: string }>, slug: string, sessionId: string) => {
   const event = eventsIn(feeds, slug).find((e) => e.UID === `${sessionId}@ymca-calendar`);
   assert.ok(event, `Session ${sessionId} not in ${slug}`);
@@ -132,19 +134,18 @@ test("fetches every Category's week pages across the window", async () => {
   assert.deepEqual(fetch.requested.filter((u) => !isDetailUrl(u)).sort(), expected.sort());
 });
 
-test("publishes five Feeds, each with its calendar name", async () => {
+test("publishes one Feed per Space, each with its calendar name", async () => {
   const { feeds } = await buildWith();
   assert.deepEqual(
     feeds.map((f) => f.filename),
-    SLUGS.map((s) => `${s}.ics`),
+    SPACE_SLUGS.map((s) => `${s}.ics`),
   );
   const names = feeds.map((f) => f.ics.match(/\r\nX-WR-CALNAME:(.*)\r\n/)?.[1]);
   assert.deepEqual(names, [
-    "YMCA McDonald · Group Fitness",
-    "YMCA McDonald · Aquatics",
-    "YMCA McDonald · Adult Recreational Sports",
-    "YMCA McDonald · Child Youth and Family Programs",
-    "YMCA McDonald · Community and Leadership",
+    "YMCA McDonald · Pool",
+    "YMCA McDonald · Gyms",
+    "YMCA McDonald · Studio 1",
+    "YMCA McDonald · Studio 2",
   ]);
   for (const feed of feeds) {
     assert.match(feed.ics, /^BEGIN:VCALENDAR\r\n/);
@@ -155,19 +156,17 @@ test("publishes five Feeds, each with its calendar name", async () => {
 test("includes every real Session in the window and ignores filler slots", async () => {
   const { feeds } = await buildWith();
   const realSessions = (html: string) => html.match(/openScheduleModal\('\/classes\/class\//g)?.length ?? 0;
-  assert.equal(
-    eventsIn(feeds, "group-fitness").length,
-    realSessions(fixture("week-1-group-fitness-2026-11-16.html")) +
-      realSessions(fixture("week-1-group-fitness-2026-11-23.html")),
-  );
-  assert.equal(eventsIn(feeds, "aquatics").length, realSessions(fixture("week-2-aquatics-2026-11-23.html")));
-  assert.ok(feeds.flatMap((f) => parseEvents(f.ics)).every((e) => e.SUMMARY && e.DTSTART && e.DTEND));
+  const expected = Object.values(CAPTURED_WEEKS).reduce((n, html) => n + realSessions(html), 0);
+  const events = allEvents(feeds);
+  assert.equal(events.length, expected);
+  assert.equal(new Set(events.map((e) => e.UID)).size, events.length, "no Session is in two Feeds");
+  assert.ok(events.every((e) => e.SUMMARY && e.DTSTART && e.DTEND));
 });
 
 test("excludes Sessions more than 7 days old", async () => {
   // On Tue 2026-11-24 the window starts on Tue 2026-11-17.
   const { feeds } = await buildWith({ now: new Date("2026-11-24T17:00:00Z") });
-  const uids = new Set(eventsIn(feeds, "group-fitness").map((e) => e.UID));
+  const uids = new Set(allEvents(feeds).map((e) => e.UID));
   const html = fixture("week-1-group-fitness-2026-11-16.html");
   const monday = idsOn(html, "16-11-2026");
   const tuesday = idsOn(html, "17-11-2026");
@@ -181,7 +180,7 @@ test("excludes Sessions beyond 2 weeks after the current week", async () => {
   const html = movedWeek(fixture("week-1-group-fitness-2026-11-23.html"), 20, "x");
   const fetch = fakeFetcher({ ...allPages(), [weekUrl(1, "2026-12-07")]: html });
   const { feeds } = await buildWith({ fetch });
-  const uids = new Set(eventsIn(feeds, "group-fitness").map((e) => e.UID));
+  const uids = new Set(allEvents(feeds).map((e) => e.UID));
   const lastDay = idsOn(html, "13-12-2026");
   const beyond = idsOn(html).filter((id) => !lastDay.includes(id));
   assert.ok(lastDay.length > 0 && beyond.length > 0);
@@ -189,18 +188,96 @@ test("excludes Sessions beyond 2 weeks after the current week", async () => {
   assert.ok(beyond.every((id) => !uids.has(`${id}@ymca-calendar`)), "after Sun 2026-12-13 is outside");
 });
 
-test("publishes an empty Community and Leadership Feed without holding back", async () => {
+test("publishes an empty Community and Leadership Category without holding back", async () => {
+  const { decision, alerts } = await buildWith();
+  assert.equal(decision, "publish");
+  assert.deepEqual(alerts, []);
+});
+
+test("publishes a Space's Feed even when it has no Sessions", async () => {
   const { decision, feeds, alerts } = await buildWith();
   assert.equal(decision, "publish");
   assert.deepEqual(alerts, []);
-  assert.equal(eventsIn(feeds, "community-leadership").length, 0);
+  assert.equal(eventsIn(feeds, "studio-1").length, 0);
+});
+
+test("lists a Feed's events in start order", async () => {
+  const { feeds } = await buildWith();
+  const starts = eventsIn(feeds, "studio-2").map((e) => e.DTSTART!);
+  assert.ok(starts.length > 1);
+  assert.deepEqual(starts, [...starts].sort());
+});
+
+// --- Spaces
+
+test("gathers a Space's Sessions from every Category", async () => {
+  const { feeds } = await buildWith({ fetch: fakeFetcher(allPages(), detailPage("Gym 2", "A Program.")) });
+  const categories = new Set(eventsIn(feeds, "gyms").map((e) => e.DESCRIPTION!.match(/Category: ([^\\]+)/)?.[1]));
+  assert.deepEqual([...categories].sort(), [
+    "Adult Recreational Sports",
+    "Aquatics",
+    "Child Youth and Family Programs",
+    "Group Fitness",
+  ]);
+});
+
+test("puts Gym 1, Gym 2, and Gym 1 and 2 Sessions in the Gyms Feed, each showing its own Room", async () => {
+  const html = fixture("week-3-adult-recreational-sports-2026-11-23.html");
+  const [a, b] = idsOn(html);
+  const pages = { ...allPages(), [detailUrl(a!)]: detailPage("Gym 1", "x"), [detailUrl(b!)]: detailPage("Gym 2", "x") };
+  const { feeds } = await buildWith({ fetch: fakeFetcher(pages) });
+  assert.equal(eventFor(feeds, "gyms", a!).LOCATION, "Gym 1");
+  assert.equal(eventFor(feeds, "gyms", b!).LOCATION, "Gym 2");
+  assert.equal(eventFor(feeds, "gyms", MUSCLEFIT_FRI).LOCATION, "Gym 1 and 2");
+});
+
+test("puts Strength and Conditioning Room Sessions in the Studio 2 Feed, keeping their Room", async () => {
+  const [id] = idsOn(fixture("week-1-group-fitness-2026-11-23.html")).filter((i) => i !== MUSCLEFIT_FRI);
+  const pages = { ...allPages(), [detailUrl(id!)]: detailPage("Strength and Conditioning Room", "x") };
+  const { feeds, alerts } = await buildWith({ fetch: fakeFetcher(pages) });
+  assert.deepEqual(alerts, []);
+  assert.equal(eventFor(feeds, "studio-2", id!).LOCATION, "Strength and Conditioning Room");
+});
+
+test("puts Pickleball League in the Gyms Feed, though VirtuaGym gives it no Room", async () => {
+  const league = "1483451459-6aecd6a5617659-40640508"; // Pickleball League (18+yrs) ⓡ
+  const pages = { ...allPages(), [detailUrl(league)]: '<div class="event-description-holder"><p>League.</p></div>' };
+  const { feeds, alerts } = await buildWith({ fetch: fakeFetcher(pages) });
+  assert.deepEqual(alerts, []);
+  const event = eventFor(feeds, "gyms", league);
+  assert.equal(event.SUMMARY, "Pickleball League (18+yrs) ⓡ");
+  assert.equal(event.LOCATION, undefined);
+});
+
+test("puts Pickleball League in the Gyms Feed even when its detail page fails to load", async () => {
+  const league = "1483451459-6aecd6a5617659-40640508";
+  const served = fakeFetcher();
+  const fetch: Fetcher = async (url) => {
+    if (url === detailUrl(league)) throw new Error("503 Service Unavailable");
+    return served(url);
+  };
+  const { feeds } = await buildWith({ fetch });
+  assert.ok(eventFor(feeds, "gyms", league));
+});
+
+test("warns, and leaves the Session out, when its Room is in no Space", async () => {
+  const [id] = idsOn(fixture("week-2-aquatics-2026-11-23.html")).filter((i) => i !== AQUAFIT_MON);
+  const pages = { ...allPages(), [detailUrl(id!)]: detailPage("Gym 3", "x") };
+  const { decision, feeds, alerts } = await buildWith({ fetch: fakeFetcher(pages) });
+  assert.equal(decision, "publish");
+  assert.ok(allEvents(feeds).every((e) => e.UID !== uidOf(id!)));
+  assert.equal(alerts.length, 1);
+  assert.equal(alerts[0]!.severity, "warning");
+  assert.match(alerts[0]!.message, /Gym 3/);
+  assert.deepEqual(alerts[0]!.categories, ["Aquatics"]);
+  assert.equal(alerts[0]!.published, true);
 });
 
 // --- Events
 
 test("maps a Session to an event in Toronto time, with its Leader and Category", async () => {
   const { feeds } = await buildWith();
-  const muscleFit = eventFor(feeds, "group-fitness", MUSCLEFIT_FRI);
+  const muscleFit = eventFor(feeds, "gyms", MUSCLEFIT_FRI);
   assert.equal(muscleFit.SUMMARY, "MuscleFit");
   assert.equal(muscleFit.DTSTART, "20261120T113000Z");
   assert.equal(muscleFit.DTEND, "20261120T121500Z");
@@ -209,7 +286,7 @@ test("maps a Session to an event in Toronto time, with its Leader and Category",
 
 test("shows the Room as the location and the Program description last, from the detail page", async () => {
   const { feeds } = await buildWith();
-  const muscleFit = eventFor(feeds, "group-fitness", MUSCLEFIT_FRI);
+  const muscleFit = eventFor(feeds, "gyms", MUSCLEFIT_FRI);
   assert.equal(muscleFit.LOCATION, "Gym 1 and 2");
   assert.match(
     muscleFit.DESCRIPTION!,
@@ -219,7 +296,7 @@ test("shows the Room as the location and the Program description last, from the 
 
 test("keeps ⓢ in the title and says Sign-up required, with AquaFit in the Pool", async () => {
   const { feeds } = await buildWith();
-  const aquaFit = eventFor(feeds, "aquatics", AQUAFIT_MON);
+  const aquaFit = eventFor(feeds, "pool", AQUAFIT_MON);
   assert.equal(aquaFit.SUMMARY, "AquaFit (Combo) ⓢ");
   assert.equal(aquaFit.LOCATION, "Pool");
   assert.match(aquaFit.DESCRIPTION!, /^Leader: Nick Wilcox\\nCategory: Aquatics\\nSign-up required\\n\\nYMCA AquaFit/);
@@ -227,7 +304,7 @@ test("keeps ⓢ in the title and says Sign-up required, with AquaFit in the Pool
 
 test("says Registration required for a ⓡ Program", async () => {
   const { feeds } = await buildWith();
-  const lessons = eventsIn(feeds, "aquatics").filter((e) => e.SUMMARY === "Swimming Lessons ⓡ");
+  const lessons = allEvents(feeds).filter((e) => e.SUMMARY === "Swimming Lessons ⓡ");
   assert.ok(lessons.length > 0, "no Swimming Lessons ⓡ");
   for (const e of lessons) {
     assert.match(e.DESCRIPTION!, /Category: Aquatics\\nRegistration required\\n/);
@@ -237,16 +314,17 @@ test("says Registration required for a ⓡ Program", async () => {
 
 test("names the Category in every event's description", async () => {
   const { feeds } = await buildWith();
-  const names: Record<string, string> = {
-    "group-fitness": "Group Fitness",
-    aquatics: "Aquatics",
-    "adult-recreational-sports": "Adult Recreational Sports",
-    "child-youth-family": "Child Youth and Family Programs",
-  };
-  for (const [slug, name] of Object.entries(names)) {
-    const events = eventsIn(feeds, slug);
-    assert.ok(events.length > 0, `no ${slug} events`);
-    assert.ok(events.every((e) => e.DESCRIPTION?.includes(`Category: ${name}`)), slug);
+  const weeks: Array<[string, string]> = [
+    ["week-1-group-fitness-2026-11-23.html", "Group Fitness"],
+    ["week-2-aquatics-2026-11-23.html", "Aquatics"],
+    ["week-3-adult-recreational-sports-2026-11-23.html", "Adult Recreational Sports"],
+    ["week-4-child-youth-family-2026-11-23.html", "Child Youth and Family Programs"],
+  ];
+  const byUid = new Map(allEvents(feeds).map((e) => [e.UID, e]));
+  for (const [file, name] of weeks) {
+    const ids = idsOn(fixture(file));
+    assert.ok(ids.length > 0, `no ${name} Sessions`);
+    for (const id of ids) assert.match(byUid.get(uidOf(id))?.DESCRIPTION ?? "", new RegExp(`Category: ${name}`), id);
   }
 });
 
@@ -270,7 +348,7 @@ test("omits the Leader line when VirtuaGym lists no Leader", async () => {
   );
   const fetch = fakeFetcher({ ...allPages(), [weekUrl(1, "2026-11-16")]: html });
   const { feeds } = await buildWith({ fetch });
-  const session = eventFor(feeds, "group-fitness", "1299926966-682cd055cc38a7-29770412");
+  const session = eventFor(feeds, "studio-2", "1299926966-682cd055cc38a7-29770412");
   assert.match(session.DESCRIPTION!, /^Category: Group Fitness/);
 });
 
@@ -278,10 +356,10 @@ test("omits the Leader line when VirtuaGym lists no Leader", async () => {
 
 test("doesn't fetch the detail page of a Session already in the cache", async () => {
   const fetch = fakeFetcher();
-  const detailCache = { [MUSCLEFIT_FRI]: { room: "Cached Room", description: "Cached description." } };
+  const detailCache = { [MUSCLEFIT_FRI]: { room: "Studio 1", description: "Cached description." } };
   const result = await buildWith({ fetch, detailCache });
   assert.ok(!fetch.requested.includes(detailUrl(MUSCLEFIT_FRI)));
-  assert.equal(eventFor(result.feeds, "group-fitness", MUSCLEFIT_FRI).LOCATION, "Cached Room");
+  assert.equal(eventFor(result.feeds, "studio-1", MUSCLEFIT_FRI).LOCATION, "Studio 1");
   assert.deepEqual(result.detailCache[MUSCLEFIT_FRI], detailCache[MUSCLEFIT_FRI]);
 });
 
@@ -304,7 +382,7 @@ test("drops cache entries for Sessions no longer listed", async () => {
   assert.ok(detailCache[MUSCLEFIT_FRI]);
 });
 
-test("publishes a Session without a Room when its detail page fails to load", async () => {
+test("leaves a Session out of every Feed when its detail page fails to load", async () => {
   const served = fakeFetcher();
   const fetch: Fetcher = async (url) => {
     if (url === detailUrl(MUSCLEFIT_FRI)) throw new Error("503 Service Unavailable");
@@ -312,9 +390,7 @@ test("publishes a Session without a Room when its detail page fails to load", as
   };
   const { decision, feeds, detailCache } = await buildWith({ fetch });
   assert.equal(decision, "publish");
-  const event = eventFor(feeds, "group-fitness", MUSCLEFIT_FRI);
-  assert.equal(event.LOCATION, undefined);
-  assert.equal(event.DESCRIPTION, "Leader: Eduardo Gonzalez\\nCategory: Group Fitness");
+  assert.ok(allEvents(feeds).every((e) => e.UID !== uidOf(MUSCLEFIT_FRI)));
   assert.equal(detailCache[MUSCLEFIT_FRI], undefined, "a failed page isn't cached, so it's retried");
 });
 
@@ -386,7 +462,7 @@ test("warns, and still publishes, when a Category's Session count more than halv
 
   const { decision, feeds, alerts, state } = await buildWith({ previousState });
   assert.equal(decision, "publish");
-  assert.equal(feeds.length, 5);
+  assert.equal(feeds.length, 4);
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0]!.severity, "warning");
   assert.deepEqual(alerts[0]!.categories, ["Aquatics"]);
@@ -405,7 +481,7 @@ test("doesn't warn when a Category's Session count falls by exactly half", async
 test("warns, and still publishes, when more than 10% of Sessions have no Room", async () => {
   const { decision, feeds, alerts } = await buildWith({ fetch: fakeFetcher(allPages(), null) }); // detail pages fail
   assert.equal(decision, "publish");
-  assert.equal(feeds.length, 5);
+  assert.equal(feeds.length, 4);
   assert.equal(alerts.length, 1);
   assert.equal(alerts[0]!.severity, "warning");
   assert.match(alerts[0]!.message, /no Room/);

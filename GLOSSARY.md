@@ -11,8 +11,12 @@ A single YMCA facility. Only the McDonald Family YMCA Centre is in scope.
 _Avoid_: Location, branch, gym, club
 
 **Room**:
-The space inside a Centre where a Session takes place, e.g. Studio, Pool, or "Gym 1 and 2" when a Session uses more than one space.
+The space inside a Centre where a Session takes place, e.g. Studio 2, Pool, or "Gym 1 and 2" when a Session uses more than one space.
 _Avoid_: Location, area, facility
+
+**Space**:
+One or more Rooms that people think of as one place, e.g. the Gyms (Gym 1, Gym 2, and Gym 1 and 2). Most Spaces are a single Room.
+_Avoid_: Location, zone, venue
 
 **Program**:
 A named activity the Centre runs repeatedly, e.g. Aquafit.
@@ -27,7 +31,7 @@ The person running a Session.
 _Avoid_: Instructor, coach, teacher, trainer
 
 **Category**:
-The YMCA's grouping of Programs. There are five: Group Fitness, Aquatics, Adult Recreational Sports, Child Youth and Family Programs, and Community and Leadership.
+The YMCA's grouping of Programs. There are five: Group Fitness, Aquatics, Adult Recreational Sports, Child Youth and Family Programs, and Community and Leadership. A Space's Sessions can come from several Categories.
 _Avoid_: Type, department, program type
 
 **Sign-up**:
@@ -41,5 +45,5 @@ _Avoid_: Enrolment, sign-up
 ### The calendar
 
 **Feed**:
-A subscribable calendar holding the Sessions of one Category.
+A subscribable calendar holding the Sessions in one Space, from every Category.
 _Avoid_: Calendar, ICS, subscription

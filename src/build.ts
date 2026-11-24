@@ -76,6 +76,37 @@ const CATEGORIES: Category[] = [
   { eventType: 5, slug: "community-leadership", name: "Community and Leadership", mayBeEmpty: true },
 ];
 
+interface Space {
+  slug: string;
+  name: string;
+  /** The Room strings VirtuaGym uses for this Space, exactly as written. */
+  rooms: string[];
+  /** Programs VirtuaGym gives no Room that belong in this Space, matched by the start of their name. */
+  roomlessPrograms?: string[];
+}
+
+/** Each Space gets a Feed, even when empty. A Room not listed here raises a warning. */
+const SPACES: Space[] = [
+  { slug: "pool", name: "Pool", rooms: ["Pool"] },
+  // VirtuaGym books the same gyms three ways and moves Programs between them.
+  {
+    slug: "gyms",
+    name: "Gyms",
+    rooms: ["Gym 1", "Gym 2", "Gym 1 and 2"],
+    roomlessPrograms: ["Pickleball League"],
+  },
+  { slug: "studio-1", name: "Studio 1", rooms: ["Studio 1"] },
+  // "Strength and Conditioning Room" is only used for Small Group Training, also booked in Studio 2.
+  { slug: "studio-2", name: "Studio 2", rooms: ["Studio 2", "Strength and Conditioning Room"] },
+];
+
+/** A listed Session with what the build knows about it. */
+interface Found {
+  session: ListedSession;
+  category: Category;
+  detail: SessionDetail | undefined;
+}
+
 /** Days of past Sessions kept, so last week's don't vanish from calendars the moment they end. */
 const DAYS_BACK = 7;
 
@@ -95,8 +126,13 @@ const COUNT_DROP_THRESHOLD = 0.5;
 const MISSING_ROOM_THRESHOLD = 0.1;
 
 /**
- * Builds one Feed per Category from VirtuaGym, covering the past 7 days, the
- * current week and the next 2 weeks in Centre time.
+ * Builds one Feed per Space from VirtuaGym, covering the past 7 days, the
+ * current week and the next 2 weeks in Centre time. VirtuaGym is read one Category
+ * at a time, so the health checks below are per Category.
+ *
+ * A Session goes in the Feed of the Space its Room belongs to. A Session with no Room
+ * is in no Feed, unless a Space claims its Program; one whose Room is in no Space is
+ * left out with a warning.
  *
  * Holds back, with a failure alert, if any Category finds no Sessions this week
  * or can't be fetched or parsed: publishing then would wipe subscribers' calendars.
@@ -119,7 +155,7 @@ export async function build({
   const weeks: string[] = [];
   for (let week = mondayOf(windowStart); week <= windowEnd; week = addDays(week, 7)) weeks.push(week);
 
-  const feeds: Feed[] = [];
+  const found: Found[] = [];
   const nextCache: DetailCache = {};
   const sessionCounts: Record<string, number> = {};
   const dropped: Array<{ category: string; from: number; to: number }> = [];
@@ -161,17 +197,7 @@ export async function build({
     if (missing > 0) withoutRoom.push(category.name);
     sessionTotal += sessions.length;
     missingRooms += missing;
-    feeds.push({
-      slug: category.slug,
-      filename: `${category.slug}.ics`,
-      ics: renderCalendar({
-        name: `YMCA McDonald · ${category.name}`,
-        timeZone: CENTRE_TIME_ZONE,
-        refreshHours: REFRESH_HOURS,
-        stamp: now,
-        events: sessions.map((s) => toEvent(s, category, details.get(s.id))),
-      }),
-    });
+    for (const session of sessions) found.push({ session, category, detail: details.get(session.id) });
   }
 
   const alerts: Alert[] = [];
@@ -222,6 +248,17 @@ export async function build({
       published: true,
     });
   }
+  const { feeds, unknownRooms } = feedsBySpace(found, now);
+  if (unknownRooms.size > 0) {
+    const rooms = [...unknownRooms].map(([room, { sessions }]) => `${room} (${sessions})`).join(", ");
+    const categories = new Set([...unknownRooms.values()].flatMap((u) => [...u.categories]));
+    alerts.push({
+      severity: "warning",
+      message: `Sessions in a Room no Space covers were left out: ${rooms}. Add the Room to a Space.`,
+      categories: CATEGORIES.map((c) => c.name).filter((name) => categories.has(name)),
+      published: true,
+    });
+  }
   if (sessionTotal > 0 && missingRooms / sessionTotal > MISSING_ROOM_THRESHOLD) {
     alerts.push({
       severity: "warning",
@@ -238,6 +275,51 @@ export async function build({
     detailCache: nextCache,
     state: { sessionCounts, failed: false },
   };
+}
+
+/** Sorts Sessions into one Feed per Space, noting Rooms that belong to no Space. */
+function feedsBySpace(
+  found: Found[],
+  now: Date,
+): { feeds: Feed[]; unknownRooms: Map<string, { sessions: number; categories: Set<string> }> } {
+  const bySpace = new Map<string, Found[]>(SPACES.map((space) => [space.slug, []]));
+  const spaceOf = new Map(SPACES.flatMap((space) => space.rooms.map((room) => [room, space.slug] as const)));
+  const unknownRooms = new Map<string, { sessions: number; categories: Set<string> }>();
+  const seen = new Set<string>();
+  for (const f of found) {
+    if (seen.has(f.session.id)) continue;
+    seen.add(f.session.id);
+    const room = f.detail?.room;
+    if (!room) {
+      const space = SPACES.find((sp) => sp.roomlessPrograms?.some((p) => f.session.program.startsWith(p)));
+      if (space) bySpace.get(space.slug)!.push(f);
+      continue;
+    }
+    const slug = spaceOf.get(room);
+    if (slug) {
+      bySpace.get(slug)!.push(f);
+      continue;
+    }
+    const unknown = unknownRooms.get(room) ?? { sessions: 0, categories: new Set<string>() };
+    unknown.sessions++;
+    unknown.categories.add(f.category.name);
+    unknownRooms.set(room, unknown);
+  }
+  const feeds = SPACES.map((space) => ({
+    slug: space.slug,
+    filename: `${space.slug}.ics`,
+    ics: renderCalendar({
+      name: `YMCA McDonald · ${space.name}`,
+      timeZone: CENTRE_TIME_ZONE,
+      refreshHours: REFRESH_HOURS,
+      stamp: now,
+      events: bySpace
+        .get(space.slug)!
+        .map((f) => toEvent(f.session, f.category, f.detail))
+        .sort((a, b) => a.start.getTime() - b.start.getTime() || a.uid.localeCompare(b.uid)),
+    }),
+  }));
+  return { feeds, unknownRooms };
 }
 
 /**
